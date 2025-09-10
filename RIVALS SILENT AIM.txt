@@ -1,0 +1,756 @@
+--[[ Server Hop • Rayfield UI (2025) – Ultimate Patch (updated v2)
+     - Fixes & hardening: persistence, safe http loading, UI parenting guards,
+       toggle_favorite persistence bug fixed, tooltip guards, logging improvements.
+     - Added: favorites list on Favorites tab, Join by JobId, sort order respect,
+       safer teleport logic, debounce/background polling improvements.
+--]]
+
+-- === Services & Locals ===
+local Players            = game:GetService("Players")
+local TeleportService    = game:GetService("TeleportService")
+local HttpService        = game:GetService("HttpService")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+
+local LocalPlayer        = Players.LocalPlayer
+local PlaceId            = game.PlaceId
+local CurrentJobId       = tostring(game.JobId or "")
+local LastJoinedServerId = nil
+
+-- === Runtime toggles ===
+local DEBUG = false -- set to true to print verbose logs to console
+local function log(...) if DEBUG then print("[ServerHop DEBUG]", ...) end end
+
+-- === Persistence helpers (writefile/readfile best-effort) ===
+local canWrite = type(writefile) == "function" and type(readfile) == "function"
+local cfgFile = "ServerHop_RayUI_config.json"
+
+local function save_config(cfgTable)
+    if not canWrite then
+        log("writefile unavailable; not saving config to disk")
+        return
+    end
+    local ok, err = pcall(function()
+        writefile(cfgFile, HttpService:JSONEncode(cfgTable or {}))
+    end)
+    if not ok then warn("Failed saving config:", err) end
+end
+
+local function load_config()
+    if not canWrite then return nil end
+    local ok, content = pcall(function() return readfile(cfgFile) end)
+    if not ok or not content or content == "" then return nil end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if ok2 and type(data) == "table" then return data end
+    return nil
+end
+
+-- === Default config ===
+local cfg = {
+    minOpenSlots    = 1,
+    scanPages       = 6,
+    autoHop         = false,
+    autoHopInterval = 45,
+    sortMode        = "Lowest", -- "Lowest", "Highest", "Random"
+    lastServerList  = {},
+    lastFilter      = "",
+    favorites       = {},
+    ui_refresh_rate = 12,
+    debug           = false,
+}
+
+-- Try load persisted config (merge safely)
+do
+    local persisted = load_config()
+    if persisted and type(persisted) == "table" then
+        for k,v in pairs(persisted) do
+            cfg[k] = v
+        end
+        DEBUG = cfg.debug or DEBUG
+    end
+end
+
+-- === HTTP helpers (robust) ===
+local function attempt_call(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if ok and res then return res end
+    return nil, res
+end
+
+local function safe_http_get(url)
+    -- Return body string or nil,err
+    -- prefer executor request wrappers, fallback to HttpService:GetAsync
+    -- syn.request
+    if syn and type(syn.request) == "function" then
+        local r = attempt_call(syn.request, {Url = url, Method = "GET"})
+        if r and type(r.Body) == "string" and r.Body ~= "" then return r.Body end
+        if r and type(r.body) == "string" and r.body ~= "" then return r.body end
+    end
+
+    -- http_request (various)
+    if type(http_request) == "function" then
+        local r = attempt_call(http_request, {Url = url, Method = "GET"})
+        if r and type(r.Body) == "string" and r.Body ~= "" then return r.Body end
+        if r and type(r.body) == "string" and r.body ~= "" then return r.body end
+    end
+
+    -- request
+    if type(request) == "function" then
+        local r = attempt_call(request, {Url = url, Method = "GET"})
+        if r and type(r.Body) == "string" and r.Body ~= "" then return r.Body end
+        if r and type(r.body) == "string" and r.body ~= "" then return r.body end
+    end
+
+    -- game:HttpGet
+    if type(game.HttpGet) == "function" then
+        local r = attempt_call(function(u) return game:HttpGet(u) end, url)
+        if r and type(r) == "string" and r ~= "" then return r end
+    end
+
+    -- HttpService:GetAsync (requires HttpEnabled)
+    local ok, r = pcall(function() return HttpService:GetAsync(url) end)
+    if ok and type(r) == "string" and r ~= "" then return r end
+
+    return nil, "no http function available or all attempts failed"
+end
+
+local function safe_load_and_run(url, name)
+    name = name or url
+    local body, err = safe_http_get(url)
+    if not body then
+        warn(("safe_load_and_run: fetch failed for %s: %s"):format(tostring(name), tostring(err)))
+        return false, ("fetch failed: %s"):format(tostring(err))
+    end
+
+    local preview = tostring(body):sub(1, 512)
+    if preview:lower():find("<!doctype") or preview:lower():find("<html") or preview:match("404") then
+        warn(("safe_load_and_run: %s returned HTML or error page (preview): %s"):format(tostring(name), preview))
+        return false, "remote returned non-lua (html or error page)"
+    end
+
+    local fn, compileErr = loadstring(body)
+    if not fn then
+        warn(("safe_load_and_run: compile error for %s: %s"):format(tostring(name), tostring(compileErr)))
+        warn("Payload preview:", preview)
+        return false, ("compile error: %s"):format(tostring(compileErr))
+    end
+
+    local ok, runErr = pcall(fn)
+    if not ok then
+        warn(("safe_load_and_run: runtime error for %s: %s"):format(tostring(name), tostring(runErr)))
+        return false, ("runtime error: %s"):format(tostring(runErr))
+    end
+    return true, nil
+end
+
+-- === Rayfield UI load (safe) ===
+local Rayfield = nil
+do
+    local url = "https://sirius.menu/rayfield"
+    local ok, err = safe_load_and_run(url, "Rayfield")
+    if not ok then
+        notify = function(t,c,d) -- fallback notify using print if Rayfield fails
+            print(("[ServerHop] %s: %s"):format(t or "Notify", c or ""))
+        end
+        warn("Rayfield failed to load. UI will not be available. Error:", err)
+    else
+        local found = nil
+        pcall(function()
+            found = rawget(_G, "Rayfield") or rawget(_G, "rayfield") or nil
+        end)
+        if not found then
+            local body, _ = safe_http_get(url)
+            if body then
+                local wrapper = "local __R = (function()\n" .. body .. "\nend)(); return __R"
+                local fn, e = loadstring(wrapper)
+                if fn then
+                    local ok2, r = pcall(fn)
+                    if ok2 and type(r) == "table" then found = r end
+                end
+            end
+        end
+        if not found and _G and type(_G.Rayfield) == "table" then found = _G.Rayfield end
+        if not found then
+            for k,v in pairs(_G) do
+                if type(v) == "table" and type(v.CreateWindow) == "function" then found = v; break end
+            end
+        end
+        Rayfield = found
+    end
+end
+
+-- If Rayfield missing, create a very small fallback UI (so script won't hard crash)
+local usingFallbackUI = false
+if not Rayfield then
+    usingFallbackUI = true
+    Rayfield = {}
+    function Rayfield:CreateWindow(args)
+        local window = {}
+        function window:CreateTab(name, icon) return {
+            CreateSection = function() end,
+            CreateButton = function(tbl) print("Button created", tbl.Name) end,
+            CreateToggle = function(tbl) print("Toggle created", tbl.Name) end,
+            CreateSlider = function(tbl) print("Slider created", tbl.Name) end,
+            CreateDropdown = function(tbl) print("Dropdown", tbl.Name) end,
+            CreateParagraph = function(tbl) print(tbl.Title, tbl.Content) end,
+            UpdateParagraph = function() end,
+            ClearAll = function() end,
+            OnClose = function() end
+        } end
+        function window:Notify(t) print("Notify:", t.Title, t.Content) end
+        function window:OnClose(f) end
+        return window
+    end
+end
+
+-- create main window (Rayfield or fallback)
+local Window = Rayfield:CreateWindow({
+    Name = "Server Hop • Ray UI",
+    LoadingTitle = "Server Hop",
+    LoadingSubtitle = "Rayfield UI",
+    ConfigurationSaving = { Enabled = true, FolderName = "ServerHop_RayUI", FileName = "Config" },
+    Discord = { Enabled = false },
+    KeySystem = false
+})
+
+local function notify(title, content, duration)
+    duration = duration or 4
+    if Window and type(Window.Notify) == "function" then
+        pcall(function() Window:Notify({ Title = title or "Server Hop", Content = content or "", Duration = duration }) end)
+    else
+        print(("[ServerHop] %s: %s"):format(title or "Notify", content or ""))
+    end
+end
+
+-- === Tabs ===
+local TabMain      = Window:CreateTab("Main", 4483362458)
+local TabInfo      = Window:CreateTab("Server Info", 4483362458)
+local TabSettings  = Window:CreateTab("Settings", 4483362458)
+local TabFavorites = Window:CreateTab("Favorites", 4483362458)
+
+-- === Core network & teleport functions (robust) ===
+local function teleport_to(serverId, maxRetries)
+    maxRetries = maxRetries or 3
+    if not serverId or tostring(serverId) == "" then
+        notify("Teleport", "Invalid server id.", 4); return false
+    end
+    serverId = tostring(serverId)
+    if serverId == CurrentJobId then
+        notify("Teleport Skipped", "You're already in that server.", 3); return false
+    end
+    for attempt = 1, maxRetries do
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(PlaceId, serverId, LocalPlayer)
+        end)
+        if ok then
+            -- We set LastJoinedServerId here to allow Rejoin button to work even if teleport hands off
+            LastJoinedServerId = serverId
+            CurrentJobId = serverId
+            notify("Teleport", "Teleport initiated.", 2)
+            return true
+        end
+        local backoff = 2 ^ (attempt - 1)
+        task.wait(backoff)
+        if attempt == maxRetries then
+            warn("Teleport failed:", err)
+            notify("Teleport Failed", "Could not teleport after retries.", 5)
+            return false
+        end
+    end
+end
+
+local function safe_json_decode(body)
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok then return nil, tostring(data) end
+    return data, nil
+end
+
+-- fetch servers with pagination, dedupe, and safety guards
+local function fetch_servers()
+    local servers, seen, cursor, page = {}, {}, nil, 0
+    local pages = math.max(1, math.floor(cfg.scanPages or 1))
+    -- decide sortOrder param to help Roblox endpoint (Asc <-> Lowest ; Desc <-> Highest)
+    local orderParam = "Asc"
+    if cfg.sortMode == "Highest" then orderParam = "Desc" end
+    while page < pages do
+        page = page + 1
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100"):format(PlaceId, orderParam)
+        if cursor and tostring(cursor) ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
+        local body, err = safe_http_get(url)
+        if not body then
+            warn("fetch_servers: http fetch failed page", page, err)
+            break
+        end
+        local data, jerr = safe_json_decode(body)
+        if not data or type(data) ~= "table" or not data.data then
+            warn("fetch_servers: json parse failed on page", page, jerr)
+            break
+        end
+        for _, srv in ipairs(data.data) do
+            local playing = tonumber(srv.playing or srv.playerCount or srv.playingCount or 0) or 0
+            local maxP = tonumber(srv.maxPlayers or srv.maxPlayerCount or 0) or 0
+            local openSlots = math.max(0, (maxP - playing))
+            local id = tostring(srv.id or srv.jobId or "")
+            if id ~= "" and id ~= CurrentJobId and maxP > 0 and openSlots >= (cfg.minOpenSlots or 0) and not seen[id] then
+                seen[id] = true
+                table.insert(servers, { id = id, playing = playing, maxPlayers = maxP, open = openSlots })
+            end
+        end
+        cursor = data.nextPageCursor
+        if not cursor then break end
+        task.wait(0.08)
+    end
+
+    -- Fallback sort for Random/explicit sorts (serverPick will re-sort)
+    return servers
+end
+
+-- pick server by sort mode
+local function pick_server(list, mode)
+    mode = mode or cfg.sortMode
+    if #list == 0 then return nil end
+    if mode == "Lowest" then
+        table.sort(list, function(a,b) return a.playing < b.playing end); return list[1]
+    elseif mode == "Highest" then
+        table.sort(list, function(a,b) return a.playing > b.playing end); return list[1]
+    elseif mode == "Random" then
+        return list[math.random(1, #list)]
+    else
+        table.sort(list, function(a,b) return a.playing < b.playing end); return list[1]
+    end
+end
+
+local function server_hop(mode)
+    notify("Server Hop", "Scanning servers…", 2)
+    local list = fetch_servers()
+    cfg.lastServerList = list
+    if #list == 0 then notify("Server Hop", "No suitable servers found.", 4); return end
+    local target = pick_server(list, mode)
+    if not target then notify("Server Hop", "No target after filtering.", 4); return end
+    notify("Server Hop", ("Joining %d/%d (open %d)"):format(target.playing, target.maxPlayers, target.open), 3)
+    teleport_to(target.id)
+end
+
+-- === UI Creation & Logic (server browser + animations + favorites highlight) ===
+local serverBrowserGui = nil
+local serverRowMap = {} -- jobId -> entry { frame, label, joinBtn, starBtn }
+
+local function starFor(id) return (cfg.favorites and cfg.favorites[id]) and "★" or "☆" end
+
+local function toggle_favorite(jobId)
+    jobId = tostring(jobId)
+    cfg.favorites = cfg.favorites or {}
+    if cfg.favorites[jobId] then cfg.favorites[jobId] = nil else cfg.favorites[jobId] = true end
+    save_config(cfg)
+end
+
+local function createTooltip(parent)
+    local tip = Instance.new("Frame")
+    tip.Name = "ServerHopTooltip"
+    tip.Visible = false
+    tip.Size = UDim2.new(0, 220, 0, 60)
+    tip.BackgroundColor3 = Color3.fromRGB(28,28,36)
+    tip.BorderSizePixel = 0
+    Instance.new("UICorner", tip).CornerRadius = UDim.new(0, 8)
+    local txt = Instance.new("TextLabel", tip)
+    txt.Size = UDim2.new(1, -12, 1, -12)
+    txt.Position = UDim2.new(0, 6, 0, 6)
+    txt.BackgroundTransparency = 1
+    txt.TextColor3 = Color3.fromRGB(220,220,230)
+    txt.Font = Enum.Font.Gotham
+    txt.TextSize = 13
+    txt.TextWrapped = true
+    return tip, txt
+end
+
+local function destroyServerBrowser()
+    if serverBrowserGui and serverBrowserGui.Parent then
+        pcall(function() serverBrowserGui:Destroy() end)
+    end
+    serverBrowserGui = nil
+    serverRowMap = {}
+end
+
+local function createOrUpdateRow(scroll, listLayout, srv, tooltipText, tooltipFrame)
+    if not srv or not srv.id then return end
+    local id = tostring(srv.id)
+    local existing = serverRowMap[id]
+    if existing and existing.frame and existing.frame.Parent then
+        pcall(function()
+            existing.label.Text = string.format("Players %d/%d (open %d)\nJobId: %s", srv.playing or 0, srv.maxPlayers or 0, srv.open or 0, id)
+            existing.frame.BackgroundColor3 = cfg.favorites[id] and Color3.fromRGB(64,84,110) or Color3.fromRGB(34,34,46)
+            existing.starBtn.Text = starFor(id)
+        end)
+        return existing
+    end
+
+    -- create new entry (guarded)
+    local ok, row = pcall(function()
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(1, 0, 0, 56)
+        f.BackgroundColor3 = cfg.favorites[id] and Color3.fromRGB(64,84,110) or Color3.fromRGB(34,34,46)
+        f.Parent = scroll
+        Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
+        local stroke = Instance.new("UIStroke", f); stroke.Color = Color3.fromRGB(60,60,80); stroke.Thickness = 1
+
+        local lbl = Instance.new("TextLabel", f)
+        lbl.BackgroundTransparency = 1
+        lbl.Position = UDim2.new(0, 12, 0, 8)
+        lbl.Size = UDim2.new(1, -220, 1, -16)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 14
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextColor3 = Color3.fromRGB(220,220,230)
+        lbl.Text = string.format("Players %d/%d (open %d)\nJobId: %s", srv.playing or 0, srv.maxPlayers or 0, srv.open or 0, id)
+
+        local join = Instance.new("TextButton", f)
+        join.AnchorPoint = Vector2.new(1, 0.5)
+        join.Position = UDim2.new(1, -12, 0.5, 0)
+        join.Size = UDim2.new(0, 96, 0, 36)
+        join.Font = Enum.Font.GothamMedium
+        join.TextSize = 14
+        join.Text = "Join"
+        join.BackgroundColor3 = Color3.fromRGB(46, 110, 74)
+        join.TextColor3 = Color3.fromRGB(235,235,245)
+        Instance.new("UICorner", join).CornerRadius = UDim.new(0, 8)
+
+        local star = Instance.new("TextButton", f)
+        star.AnchorPoint = Vector2.new(1, 0.5)
+        star.Position = UDim2.new(1, -124, 0.5, 0)
+        star.Size = UDim2.new(0, 36, 0, 36)
+        star.Font = Enum.Font.Gotham
+        star.TextSize = 18
+        star.Text = starFor(id)
+        star.BackgroundColor3 = Color3.fromRGB(40,40,55)
+        star.TextColor3 = Color3.fromRGB(220,220,230)
+        Instance.new("UICorner", star).CornerRadius = UDim.new(0,8)
+
+        join.MouseButton1Click:Connect(function()
+            notify("Server Browser", ("Joining %d/%d…"):format(srv.playing or 0, srv.maxPlayers or 0), 2)
+            teleport_to(srv.id)
+        end)
+
+        star.MouseButton1Click:Connect(function()
+            toggle_favorite(srv.id)
+            star.Text = starFor(id)
+            f.BackgroundColor3 = cfg.favorites[id] and Color3.fromRGB(64,84,110) or Color3.fromRGB(34,34,46)
+        end)
+
+        lbl.MouseEnter:Connect(function()
+            pcall(function()
+                tooltipText.Text = ("JobId: %s\nPlayers: %d/%d\nOpen: %d"):format(id, srv.playing or 0, srv.maxPlayers or 0, srv.open or 0)
+                tooltipFrame.Visible = true
+                -- guard against absolute position not yet being available
+                local ok2, ax, ay = pcall(function() return f.AbsolutePosition.X, f.AbsolutePosition.Y end)
+                local ok3, ah = pcall(function() return f.AbsoluteSize.Y end)
+                if ok2 and ok3 then
+                    tooltipFrame.Position = UDim2.new(0, ax + 6, 0, ay + ah + 6)
+                end
+                lbl.TextColor3 = Color3.fromRGB(255,255,255)
+            end)
+        end)
+        lbl.MouseLeave:Connect(function()
+            tooltipFrame.Visible = false
+            lbl.TextColor3 = Color3.fromRGB(220,220,230)
+        end)
+
+        return { frame = f, label = lbl, joinBtn = join, starBtn = star }
+    end)
+    if not ok or not row then return nil end
+
+    serverRowMap[id] = row
+
+    pcall(function()
+        row.frame.BackgroundTransparency = 1
+        TweenService:Create(row.frame, TweenInfo.new(0.22, Enum.EasingStyle.Quad), { BackgroundTransparency = 0 }):Play()
+    end)
+
+    task.spawn(function() task.wait(0.02); pcall(function() scroll.CanvasSize = UDim2.new(0,0,0, listLayout.AbsoluteContentSize.Y + 16) end) end)
+
+    return serverRowMap[id]
+end
+
+local function removeRowById(scroll, listLayout, jobId)
+    local ent = serverRowMap[jobId]
+    if not ent or not ent.frame then return end
+    local frame = ent.frame
+    pcall(function()
+        TweenService:Create(frame, TweenInfo.new(0.18, Enum.EasingStyle.Quad), { BackgroundTransparency = 1, Size = UDim2.new(1,0,0,0) }):Play()
+    end)
+    task.delay(0.19, function()
+        if frame and frame.Parent then
+            pcall(function() frame:Destroy() end)
+        end
+        serverRowMap[jobId] = nil
+        pcall(function() scroll.CanvasSize = UDim2.new(0,0,0,listLayout.AbsoluteContentSize.Y + 16) end)
+    end)
+end
+
+local function createServerBrowser()
+    destroyServerBrowser()
+    serverBrowserGui = Instance.new("ScreenGui")
+    serverBrowserGui.Name = "ServerBrowserPanel"
+    serverBrowserGui.ResetOnSpawn = false
+
+    -- parent safely: prefer CoreGui when allowed, otherwise PlayerGui
+    local okParent = pcall(function()
+        local cg = game:GetService("CoreGui")
+        if cg then
+            serverBrowserGui.Parent = cg
+        end
+    end)
+    if not okParent or not serverBrowserGui.Parent then
+        local pg = LocalPlayer:WaitForChild("PlayerGui")
+        serverBrowserGui.Parent = pg
+    end
+
+    local frame = Instance.new("Frame", serverBrowserGui)
+    frame.Name = "Panel"
+    frame.AnchorPoint = Vector2.new(0.5,0.5)
+    frame.Position = UDim2.new(0.5, 0.5, 0.5, 0)
+    frame.Size = UDim2.new(0, 760, 0, 560)
+    frame.BackgroundColor3 = Color3.fromRGB(24,24,30)
+    frame.Active = true
+    frame.Draggable = true
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 16)
+    Instance.new("UIStroke", frame).Color = Color3.fromRGB(60,60,70)
+
+    local title = Instance.new("TextLabel", frame)
+    title.Size = UDim2.new(1, -40, 0, 36); title.Position = UDim2.new(0, 12, 0, 8)
+    title.Text = "Server Browser"; title.TextXAlignment = Enum.TextXAlignment.Left; title.Font = Enum.Font.GothamSemibold; title.TextSize = 18
+    title.BackgroundTransparency = 1; title.TextColor3 = Color3.fromRGB(235,235,245)
+
+    local closeBtn = Instance.new("TextButton", frame)
+    closeBtn.Size = UDim2.new(0, 28, 0, 28); closeBtn.Position = UDim2.new(1, -40, 0, 8)
+    closeBtn.Text = "X"; closeBtn.Font = Enum.Font.GothamBold; closeBtn.TextSize = 16; closeBtn.TextColor3 = Color3.fromRGB(220,80,80)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(40,40,55); Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0,8)
+    closeBtn.MouseButton1Click:Connect(destroyServerBrowser)
+
+    local searchBox = Instance.new("TextBox", frame)
+    searchBox.PlaceholderText = "Search JobId or partial..."
+    searchBox.Size = UDim2.new(0, 420, 0, 36); searchBox.Position = UDim2.new(0, 12, 0, 56)
+    searchBox.BackgroundColor3 = Color3.fromRGB(36,36,48); searchBox.TextColor3 = Color3.fromRGB(235,235,245)
+    searchBox.Font = Enum.Font.Gotham; searchBox.TextSize = 14; Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 8)
+
+    local sortBtn = Instance.new("TextButton", frame)
+    sortBtn.Size = UDim2.new(0, 128, 0, 36); sortBtn.Position = UDim2.new(0, 444, 0, 56)
+    sortBtn.Text = (cfg.sortMode == "Highest") and "↓ Players" or "↑ Players"; sortBtn.Font = Enum.Font.GothamMedium; sortBtn.TextSize = 14
+    sortBtn.BackgroundColor3 = Color3.fromRGB(36,36,48); sortBtn.TextColor3 = Color3.fromRGB(230,230,240)
+    Instance.new("UICorner", sortBtn).CornerRadius = UDim.new(0,8)
+
+    local refreshBtn = Instance.new("TextButton", frame)
+    refreshBtn.Size = UDim2.new(0, 110, 0, 36); refreshBtn.Position = UDim2.new(0, 582, 0, 56)
+    refreshBtn.Text = "Refresh"; refreshBtn.Font = Enum.Font.GothamMedium; refreshBtn.TextSize = 14
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(36,36,48); refreshBtn.TextColor3 = Color3.fromRGB(230,230,240)
+    Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0,8)
+
+    local quickHopBtn = Instance.new("TextButton", frame)
+    quickHopBtn.Size = UDim2.new(0, 120, 0, 36); quickHopBtn.Position = UDim2.new(1, -136, 0, 56)
+    quickHopBtn.Text = "Hop (Default)"; quickHopBtn.Font = Enum.Font.GothamMedium; quickHopBtn.TextSize = 14
+    quickHopBtn.BackgroundColor3 = Color3.fromRGB(42,100,152); quickHopBtn.TextColor3 = Color3.fromRGB(235,235,245)
+    Instance.new("UICorner", quickHopBtn).CornerRadius = UDim.new(0,8)
+
+    local scroll = Instance.new("ScrollingFrame", frame)
+    scroll.Name = "List"; scroll.Position = UDim2.new(0,12,0,108); scroll.Size = UDim2.new(1,-24,1,-128)
+    scroll.BackgroundTransparency = 1; scroll.ScrollBarThickness = 6; scroll.CanvasSize = UDim2.new(0,0,0,0)
+    local listLayout = Instance.new("UIListLayout", scroll); listLayout.Padding = UDim.new(0,8)
+
+    local tooltipFrame, tooltipText = createTooltip(frame)
+    tooltipFrame.Parent = frame
+    tooltipFrame.Visible = false
+
+    local sortAscending = (cfg.sortMode ~= "Highest")
+    local lastAppliedFilter = ""
+
+    local function applyList()
+        local q = tostring(cfg.lastFilter or "")
+        q = string.lower(q)
+        local filtered = {}
+        for _, s in ipairs(cfg.lastServerList or {}) do
+            if q == "" or string.find(string.lower(tostring(s.id)), q, 1, true) then
+                table.insert(filtered, s)
+            end
+        end
+        table.sort(filtered, function(a,b) if sortAscending then return a.playing < b.playing else return a.playing > b.playing end end)
+
+        local keep = {}
+        for _, s in ipairs(filtered) do
+            keep[s.id] = true
+            createOrUpdateRow(scroll, listLayout, s, tooltipText, tooltipFrame)
+        end
+        for id, ent in pairs(serverRowMap) do if not keep[id] then removeRowById(scroll, listLayout, id) end end
+        task.wait(); pcall(function() scroll.CanvasSize = UDim2.new(0,0,0, listLayout.AbsoluteContentSize.Y + 16) end)
+    end
+
+    -- controls
+    refreshBtn.MouseButton1Click:Connect(function()
+        notify("Server Browser", "Refreshing servers…", 2)
+        cfg.lastServerList = fetch_servers()
+        applyList()
+    end)
+
+    sortBtn.MouseButton1Click:Connect(function()
+        sortAscending = not sortAscending
+        sortBtn.Text = sortAscending and "↑ Players" or "↓ Players"
+        cfg.sortMode = sortAscending and "Lowest" or "Highest"
+        save_config(cfg)
+        applyList()
+    end)
+
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        cfg.lastFilter = searchBox.Text or ""
+        applyList()
+    end)
+
+    quickHopBtn.MouseButton1Click:Connect(function()
+        server_hop(cfg.sortMode)
+    end)
+
+    -- "Join by JobId" quick control at the bottom-left
+    local joinByLabel = Instance.new("TextLabel", frame)
+    joinByLabel.Position = UDim2.new(0,12,1,-56); joinByLabel.Size = UDim2.new(0,220,0,28)
+    joinByLabel.BackgroundTransparency = 1; joinByLabel.Font = Enum.Font.Gotham; joinByLabel.TextSize = 12
+    joinByLabel.TextColor3 = Color3.fromRGB(200,200,210); joinByLabel.Text = "Join by JobId:"
+    local joinText = Instance.new("TextBox", frame); joinText.Size = UDim2.new(0,280,0,28); joinText.Position = UDim2.new(0,108,1,-56)
+    joinText.BackgroundColor3 = Color3.fromRGB(36,36,48); joinText.TextColor3 = Color3.fromRGB(235,235,245); joinText.Font = Enum.Font.Gotham; joinText.TextSize = 12
+    Instance.new("UICorner", joinText).CornerRadius = UDim.new(0,6)
+    local joinBtn2 = Instance.new("TextButton", frame); joinBtn2.Size = UDim2.new(0,96,0,28); joinBtn2.Position = UDim2.new(0,400,1,-56)
+    joinBtn2.Text = "Join"; Instance.new("UICorner", joinBtn2).CornerRadius = UDim.new(0,6)
+    joinBtn2.MouseButton1Click:Connect(function()
+        local id = tostring(joinText.Text or "")
+        if id == "" then notify("Join", "Enter a JobId first.", 3) else teleport_to(id) end
+    end)
+
+    -- initial fetch + show
+    cfg.lastServerList = fetch_servers()
+    applyList()
+
+    -- background polling: update server list & update rows smoothly (debounced)
+    task.spawn(function()
+        local lastUpdate = 0
+        while serverBrowserGui and serverBrowserGui.Parent do
+            local waitT = math.max(5, cfg.ui_refresh_rate or 12)
+            task.wait(waitT)
+            if not (serverBrowserGui and serverBrowserGui.Parent) then break end
+            local newList = fetch_servers()
+            if newList and #newList > 0 then
+                -- simple change detection by size or different ids
+                local changed = ( #newList ~= #cfg.lastServerList )
+                if not changed then
+                    local mapOld, mapNew = {}, {}
+                    for _,s in ipairs(cfg.lastServerList) do mapOld[s.id] = true end
+                    for _,s in ipairs(newList) do mapNew[s.id] = true end
+                    for id,_ in pairs(mapOld) do if not mapNew[id] then changed = true; break end end
+                end
+                if changed then
+                    cfg.lastServerList = newList
+                    local newMap = {}
+                    for _, s in ipairs(newList) do newMap[s.id] = s end
+                    for _, s in ipairs(newList) do createOrUpdateRow(scroll, listLayout, s, tooltipText, tooltipFrame) end
+                    for id, entry in pairs(serverRowMap) do if not newMap[id] then removeRowById(scroll, listLayout, id) end end
+                    applyList()
+                else
+                    -- still update per-row values (players/open) to keep UI fresh
+                    for _, s in ipairs(newList) do
+                        local ent = serverRowMap[s.id]
+                        if ent and ent.label then
+                            pcall(function() ent.label.Text = string.format("Players %d/%d (open %d)\nJobId: %s", s.playing or 0, s.maxPlayers or 0, s.open or 0, s.id) end)
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- Favorites tab controls: dynamic list
+local function rebuildFavoritesUI()
+    -- Rayfield doesn't expose a straightforward "clear section" API, so we rebuild by adding buttons
+    if not TabFavorites then return end
+    -- simple favorites listing via buttons
+    TabFavorites:CreateSection("Favorites")
+    TabFavorites:CreateButton({ Name = "Open Server Browser", Callback = function() if serverBrowserGui then notify("Server Browser","Already open.",3) else createServerBrowser() end end })
+    TabFavorites:CreateButton({ Name = "Add Current Server to Favorites", Callback = function() if CurrentJobId and CurrentJobId ~= "" then cfg.favorites[CurrentJobId] = true; save_config(cfg); notify("Favorites","Added current server!",3); rebuildFavoritesUI() else notify("Favorites","No current JobId.",3) end end })
+    -- Show each favorite as its own button
+    for id,_ in pairs(cfg.favorites or {}) do
+        local label = ("Fav: %s"):format(id)
+        TabFavorites:CreateButton({
+            Name = label,
+            Callback = function()
+                -- popup options
+                notify("Favorites", ("Joining favorite %s…"):format(id), 2)
+                teleport_to(id)
+            end
+        })
+        -- small remove button alternative: create another button next to it
+        TabFavorites:CreateButton({
+            Name = ("Remove %s"):format(id),
+            Callback = function()
+                cfg.favorites[id] = nil; save_config(cfg); notify("Favorites","Removed favorite "..id,3); rebuildFavoritesUI()
+            end
+        })
+    end
+end
+rebuildFavoritesUI()
+
+-- Info tab controls
+TabInfo:CreateButton({
+    Name = "Open Server Browser (Scrollable List + Join)",
+    Callback = function()
+        if serverBrowserGui then notify("Server Browser", "Browser already open.", 3) else createServerBrowser() end
+    end
+})
+TabInfo:CreateParagraph({
+    Title = "Current Server",
+    Content = ("JobId: %s\nPlayers: %d"):format(CurrentJobId, #Players:GetPlayers())
+})
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        TabInfo:UpdateParagraph("Current Server", ("JobId: %s\nPlayers: %d"):format(CurrentJobId, #Players:GetPlayers()))
+    end)
+end)
+
+-- Main tab quick actions
+TabMain:CreateSection("Quick Actions")
+TabMain:CreateButton({ Name = "Hop to Lowest Players", Callback = function() server_hop("Lowest") end })
+TabMain:CreateButton({ Name = "Hop to Highest Players", Callback = function() server_hop("Highest") end })
+TabMain:CreateButton({ Name = "Hop to Random Server", Callback = function() server_hop("Random") end })
+TabMain:CreateButton({ Name = "Rejoin Last Hopped Server", Callback = function() if LastJoinedServerId then teleport_to(LastJoinedServerId) else notify("Info", "No last hopped server yet.", 4) end end })
+TabMain:CreateButton({ Name = "Copy Current JobId", Callback = function() if setclipboard then setclipboard(CurrentJobId); notify("Copied", "JobId copied to clipboard.", 3) else notify("Clipboard", "setclipboard not available", 4) end end })
+
+-- Settings tab controls (tie into cfg; Rayfield handles persistence of UI flags, but we also save favorites to disk)
+TabSettings:CreateSection("Auto-Hop")
+TabSettings:CreateToggle({ Name = "Auto-Hop", CurrentValue = cfg.autoHop, Callback = function(on) cfg.autoHop = on; save_config(cfg) if on then task.spawn(function() while cfg.autoHop do task.wait(math.max(5, cfg.autoHopInterval or 5)) if not cfg.autoHop then break end pcall(function() server_hop(cfg.sortMode) end) end end) end end })
+TabSettings:CreateSlider({ Name = "Auto-Hop Interval (sec)", Range = {10,180}, Increment = 5, CurrentValue = cfg.autoHopInterval, Callback = function(v) cfg.autoHopInterval = math.floor(v); save_config(cfg) end })
+TabSettings:CreateSection("Scanning & Filters")
+TabSettings:CreateSlider({ Name = "Min Open Slots", Range = {0,20}, Increment = 1, CurrentValue = cfg.minOpenSlots, Callback = function(v) cfg.minOpenSlots = math.floor(v); save_config(cfg) end })
+TabSettings:CreateSlider({ Name = "Scan Pages (x100 servers)", Range = {1,12}, Increment = 1, CurrentValue = cfg.scanPages, Callback = function(v) cfg.scanPages = math.floor(v); save_config(cfg) end })
+TabSettings:CreateDropdown({ Name = "Default Sort", Options = { "Lowest", "Highest", "Random" }, CurrentOption = cfg.sortMode, Callback = function(opt) cfg.sortMode = opt; save_config(cfg) end })
+TabSettings:CreateToggle({ Name = "Debug Mode (console logs)", CurrentValue = cfg.debug, Callback = function(on) cfg.debug = on; DEBUG = on; save_config(cfg) end })
+
+-- Keyboard shortcuts (global)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        local key = input.KeyCode
+        if key == Enum.KeyCode.R then
+            notify("Shortcut", "Refreshing servers…", 2)
+            cfg.lastServerList = fetch_servers()
+        elseif key == Enum.KeyCode.H then
+            notify("Shortcut", "Quick Hop running…", 2)
+            server_hop(cfg.sortMode)
+        elseif key == Enum.KeyCode.F then
+            if serverBrowserGui then destroyServerBrowser() else createServerBrowser() end
+        end
+    end
+end)
+
+-- Finalize (save config)
+save_config(cfg)
+
+-- Ready notice
+notify("Server Hop Ready", "All fixes applied: safer loading, persistence, live updates & UI improvements.", 6)
+log("ServerHop loaded -> CurrentJobId:", CurrentJobId, "config:", HttpService:JSONEncode({ minOpenSlots = cfg.minOpenSlots, scanPages = cfg.scanPages, sortMode = cfg.sortMode }))
+
+-- END
