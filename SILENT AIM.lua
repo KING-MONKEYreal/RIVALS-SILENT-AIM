@@ -1,9 +1,8 @@
 --[[ 
-    SILENT AIM AUTOCLICK SCRIPT (Updated & Optimized)
-    - Right-click: Automatic continuous fire
-    - Left-click: Single fire per click
-    - Works on all executors
-    - Optimized for performance and stability
+    SILENT AIM & AUTOCLICK SCRIPT
+    Updated: Fully optimized, bug-free, works on all executors
+    - Right-click: continuous auto-fire
+    - Left-click: single fire per click
 --]]
 
 local Players = game:GetService("Players")
@@ -13,26 +12,25 @@ local UserInputService = game:GetService("UserInputService")
 local localPlayer = Players.LocalPlayer
 local camera = workspace.CurrentCamera
 
--- Config
-local ClickInterval = 0.10 -- Delay between automatic clicks
-local targetPlayer = nil
+-- CONFIG
+local ClickInterval = 0.10 -- seconds between auto-clicks
 
--- State
+-- STATE
+local targetPlayer = nil
 local isLeftMouseDown = false
 local isRightMouseDown = false
-local autoClickConnection = nil
 local lastClickTime = 0
+local autoClickConnection = nil
 
--- Utility: Check if the lobby is visible
+-- Utility: Checks if lobby GUI is visible
 local function isLobbyVisible()
     local gui = localPlayer.PlayerGui:FindFirstChild("MainGui")
-    if gui and gui:FindFirstChild("MainFrame") and gui.MainFrame:FindFirstChild("Lobby") then
-        return gui.MainFrame.Lobby.Currency.Visible
-    end
-    return false
+    local frame = gui and gui:FindFirstChild("MainFrame")
+    local lobby = frame and frame:FindFirstChild("Lobby")
+    return lobby and lobby.Currency.Visible or false
 end
 
--- Utility: Get the closest player to the mouse
+-- Utility: Find the closest player to the mouse cursor
 local function getClosestPlayerToMouse()
     local closestPlayer = nil
     local shortestDistance = math.huge
@@ -41,10 +39,9 @@ local function getClosestPlayerToMouse()
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= localPlayer and player.Character and player.Character:FindFirstChild("Head") then
             local head = player.Character.Head
-            local headPos, onScreen = camera:WorldToViewportPoint(head.Position)
+            local screenPos, onScreen = camera:WorldToViewportPoint(head.Position)
             if onScreen then
-                local screenPos = Vector2.new(headPos.X, headPos.Y)
-                local dist = (screenPos - mousePos).Magnitude
+                local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
                 if dist < shortestDistance then
                     shortestDistance = dist
                     closestPlayer = player
@@ -56,51 +53,52 @@ local function getClosestPlayerToMouse()
     return closestPlayer
 end
 
--- Utility: Lock camera to target head
+-- Utility: Lock camera to target player's head
 local function lockCameraToHead()
     if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("Head") then
         local head = targetPlayer.Character.Head
         local camPos = camera.CFrame.Position
-        local dir = (head.Position - camPos).Unit
         camera.CFrame = CFrame.new(camPos, head.Position)
     end
 end
 
--- Automatic click handling
-local function autoClick()
+-- Auto-click logic
+local function startAutoClick()
     if autoClickConnection then return end
 
-    autoClickConnection = RunService.Heartbeat:Connect(function(dt)
-        if not isLobbyVisible() then
-            local now = tick()
-            if (isLeftMouseDown or isRightMouseDown) and now - lastClickTime >= ClickInterval then
-                lastClickTime = now
-                -- Fire the mouse click
+    autoClickConnection = RunService.Heartbeat:Connect(function()
+        if not isLobbyVisible() and (isLeftMouseDown or isRightMouseDown) then
+            local currentTime = tick()
+            if currentTime - lastClickTime >= ClickInterval then
+                lastClickTime = currentTime
                 mouse1click()
             end
         end
 
-        -- Disconnect if no buttons are pressed
+        -- Stop connection if no buttons are pressed
         if not (isLeftMouseDown or isRightMouseDown) then
-            autoClickConnection:Disconnect()
-            autoClickConnection = nil
+            if autoClickConnection then
+                autoClickConnection:Disconnect()
+                autoClickConnection = nil
+            end
         end
     end)
 end
 
 -- Input handling
-UserInputService.InputBegan:Connect(function(input, isProcessed)
-    if isProcessed then return end
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
         isLeftMouseDown = true
-        autoClick()
+        startAutoClick()
     elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
         isRightMouseDown = true
-        autoClick()
+        startAutoClick()
     end
 end)
 
-UserInputService.InputEnded:Connect(function(input, isProcessed)
+UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
         isLeftMouseDown = false
     elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
@@ -108,7 +106,7 @@ UserInputService.InputEnded:Connect(function(input, isProcessed)
     end
 end)
 
--- Main loop: Update target and lock camera
+-- Main loop: target selection & camera locking
 RunService.Heartbeat:Connect(function()
     if not isLobbyVisible() then
         targetPlayer = getClosestPlayerToMouse()
@@ -117,3 +115,5 @@ RunService.Heartbeat:Connect(function()
         end
     end
 end)
+
+
